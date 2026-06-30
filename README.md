@@ -122,34 +122,42 @@ curl -i http://localhost:8080/api/v1/_debug/trigger-error
 into JSON. Explain the role of a `MessageBodyWriter` / JSON provider (like Jackson)
 in this conversion.**
 
-JAX-RS resource methods return Java objects, but an HTTP response body is just a
-stream of bytes. A `MessageBodyWriter<T>` is the JAX-RS provider interface
-responsible for *marshalling* a Java type into that byte stream for a given media
-type. When a method is annotated `@Produces(MediaType.APPLICATION_JSON)`, the
-runtime performs **content negotiation**: it scans the registered providers and
-selects one whose `isWriteable(...)` returns true for the return type and
-`application/json`. Here that provider is **Jackson** (registered via
-`JacksonFeature`). Jackson's `MessageBodyWriter` reflects over the object's getters,
-builds the corresponding JSON structure, and writes it to the response
-`OutputStream`, also setting the `Content-Type` header. The reverse direction
-(JSON request body → Java object) is handled by the matching `MessageBodyReader`.
-This keeps resource code free of any manual serialisation logic.
+When my resource methods return a Java object, JAX-RS doesn't actually send the
+object itself, because an HTTP response body is just a stream of bytes. Something
+has to turn the object into those bytes, and that is the job of a
+`MessageBodyWriter`. It is the provider interface JAX-RS uses to serialise a given
+Java type into a given media type.
+
+Because I annotated my methods with `@Produces(MediaType.APPLICATION_JSON)`, the
+runtime looks through the providers it knows about and picks one that can write my
+return type as `application/json` (it checks each provider's `isWriteable(...)`
+method). In this project that provider is Jackson, which I enabled by registering
+`JacksonFeature`. Jackson reads the object's getters, builds the matching JSON,
+writes it to the response output stream and sets the `Content-Type` header for me.
+The opposite direction, taking a JSON request body and turning it back into a Java
+object, is handled by the equivalent `MessageBodyReader`. The point is that I never
+have to write any parsing or string-building code myself; the provider does all of
+it.
 
 **Q1.2 — REST architecture dictates that APIs should be strictly *stateless*. Define
 what statelessness means here and explain why it makes cloud APIs easier to scale
 horizontally.**
 
-Statelessness means the server keeps **no client session state between requests**:
-every request must carry all the information needed to process it (credentials,
-identifiers, parameters), and the server never relies on memory of a previous
-request. Because no request depends on a particular server having handled an earlier
-one, **any** server instance can handle **any** request. This is exactly what makes
-**horizontal scaling** easy: you can place many identical instances behind a load
-balancer and route each request to whichever node is free, add or remove nodes under
-load, and tolerate a node failing — without sticky sessions or shared session
-replication. State that must persist lives in the client (e.g. tokens) or in a shared
-backing store, not in the web tier, so the application servers remain
-interchangeable and trivially replaceable.
+Stateless means the server doesn't remember anything about a client between
+requests; it holds no session in memory. Every request has to bring everything the
+server needs to deal with it, so things like the resource id, any parameters and
+the authentication all travel with each request rather than being left on the
+server from a previous call.
+
+This is what makes horizontal scaling straightforward. If no request depends on a
+particular server having handled an earlier one, then it doesn't matter which
+server picks it up. I can run lots of identical instances behind a load balancer
+and send each request to whichever one is free, spin up more instances when traffic
+grows, and lose an instance without breaking anyone's "session", because there
+isn't one to lose. Anything that genuinely has to persist lives either on the
+client (for example a token) or in a shared store that every instance can reach,
+not inside the web server itself. That is what keeps the instances interchangeable,
+which is the whole reason you can scale out by just adding more of them.
 
 ### Part 2 – Workspace Management
 
@@ -157,34 +165,36 @@ interchangeable and trivially replaceable.
 `GET /workspaces` endpoint could improve performance for the client and reduce
 load on the server.**
 
-`Cache-Control` lets the server tell clients (and intermediary caches/CDNs) how
-long a response may be reused. Adding e.g. `Cache-Control: max-age=60` to
-`GET /workspaces` means that for the next 60 seconds the client can serve the
-workspace list **straight from its local cache** without making a network call.
-Benefits on both sides:
+`Cache-Control` is how the server tells the client (and any caches or CDNs in
+between) whether a response can be reused and for how long. If I add something like
+`Cache-Control: max-age=60` to `GET /workspaces`, then for the next minute the
+client can just reuse the copy it already has instead of asking the server again.
 
-- **Client performance:** repeated reads are near-instant — no round-trip latency,
-  and the UI feels faster.
-- **Reduced server load:** fewer requests reach the server, so it does less work
-  (no repeated lookups/serialisation) and consumes less bandwidth. This matters
-  for a frequently-polled, read-heavy collection like workspaces.
+For the client that means the data is effectively instant on repeat reads, because
+there is no network round-trip. For the server it means fewer requests actually
+reach it, so it isn't repeatedly looking up the same list and serialising it to
+JSON, and it sends less data over the wire. That is a real win for a list endpoint
+like workspaces, which clients are likely to read often and which doesn't change
+every second.
 
-Combined with **validation** caching (`ETag` + `If-None-Match`), the server can
-also answer an unchanged resource with a tiny **304 Not Modified** instead of
-re-sending the whole JSON body, saving bandwidth while keeping data fresh.
+I could take it a step further with `ETag` and `If-None-Match` (validation
+caching): the client sends back the tag it already has, and if nothing has changed
+the server can reply `304 Not Modified` with no body at all, so the data stays
+fresh but I still avoid resending the whole payload.
 
 **Q2.2 — If a client needs to verify whether a specific workspace *exists* but
 wants to save bandwidth by not downloading the JSON body, which HTTP method
 should they use instead of `GET`? Explain.**
 
-They should use **`HEAD`**. A `HEAD` request is identical to a `GET` — same URL,
-same routing, same status code (`200` if it exists, `404` if not) and the same
-headers (e.g. `Content-Length`) — **except the response has no body**. So the
-client learns whether the workspace exists purely from the status line and
-headers, without the server serialising or transmitting the full JSON payload.
-This saves bandwidth and processing, which is ideal for cheap existence
-("is it there?") checks. (In JAX-RS, a `@GET` method also answers `HEAD`
-automatically, with the body discarded.)
+They should use `HEAD`. A `HEAD` request behaves exactly like a `GET`: same URL,
+same routing, and it comes back with the same status code (`200` if the workspace
+is there, `404` if it isn't) and the same headers. The only difference is that the
+response has no body. So the client can tell whether the workspace exists just from
+the status code, without the server having to build and send the full JSON. That is
+ideal when you only care about existence and don't want to waste bandwidth pulling
+down data you're only going to throw away. A nice detail in JAX-RS is that I don't
+have to write a separate handler for this, because a `@GET` method automatically
+answers `HEAD` as well, just with the body left off.
 
 ### Part 3 – Model Operations & Linking
 
@@ -192,49 +202,56 @@ automatically, with the body discarded.)
 generate the unique `id` (e.g. `UUID.randomUUID()`) rather than letting the client
 supply one. Discuss the security and data-integrity reasons.**
 
-- **Data integrity / uniqueness:** the server is the single authority for the
-  key space, so it can guarantee every id is unique and collision-free. If clients
-  chose ids, two clients could submit the same id and overwrite each other's
-  records, or accidentally clobber an existing model.
-- **Security – preventing resource hijacking / IDOR:** a client-chosen id lets a
-  caller *target* a specific identifier — e.g. deliberately create `MOD-8832` to
-  overwrite, impersonate, or probe for another team's model. Server-generated,
-  non-sequential UUIDs are effectively unguessable, so they can't be enumerated
-  (`MOD-1`, `MOD-2`, …) to discover or tamper with other resources.
-- **Decoupling & consistency:** the id becomes an opaque, server-controlled
-  surrogate key. Clients can't encode meaning into it or depend on its format, and
-  the server can store/relocate the resource freely. The authoritative id is
-  returned in the `201 Created` response and `Location` header.
+Letting the server generate the id (I use `UUID.randomUUID()`) is better for a few
+reasons.
 
-In this API the POST handler explicitly **ignores any `id` in the request body**
-and assigns `"MOD-" + UUID.randomUUID()`.
+The main one is integrity. If the server owns the id, it is the single source of
+truth for the key space and can guarantee the ids are unique. If clients picked
+their own, two of them could end up choosing the same id, or a client could pick an
+id that already exists and overwrite another model's record by accident.
 
-*On validation approach:* the workspace-existence check here is done with explicit
-**manual `if`-checks**, which is transparent and needs no extra dependency. An
-alternative is **Jakarta Bean Validation** annotations (`@NotNull`, `@NotBlank`,
-custom constraints) on the POJO, which is more declarative and centralised but
-can't by itself verify cross-entity facts like "this workspace exists" — that
-referential check still requires a lookup against the data store.
+There is also a security side to it. If a client can choose the id, it can
+deliberately target one, for example creating or overwriting `MOD-8832` to clobber
+or impersonate another team's model. And if the ids were predictable or sequential
+(`MOD-1`, `MOD-2`, and so on) an attacker could simply count upwards to find or
+poke at resources that aren't theirs, which is the classic insecure-direct-object-
+reference (IDOR) problem. A random UUID isn't guessable, so that approach doesn't
+get them anywhere.
+
+Finally it keeps things clean: the id is an opaque value that the client shouldn't
+read meaning into or depend on, and the server hands the real id back in the
+`201 Created` response and the `Location` header. In my POST handler I deliberately
+ignore any `id` sent in the body and set it to `"MOD-" + UUID.randomUUID()`.
+
+It is also worth contrasting how the validation itself is done. I check that the
+workspace exists with a plain `if` statement, which is easy to follow and needs no
+extra libraries. The alternative is Jakarta Bean Validation annotations such as
+`@NotNull` and `@NotBlank` on the model, which is tidier for simple field rules,
+but it can't on its own check something like "this workspace actually exists",
+since that is a cross-entity fact that still needs a lookup in the data store.
 
 **Q3.2 — If a user searches for a framework containing spaces or special
 characters (e.g. `?framework=Scikit Learn & Tools`), how must the client modify
 the URL, and why is this encoding necessary?**
 
-The client must **percent-encode (URL-encode)** the value, so it becomes:
+The client has to percent-encode (URL-encode) the value, so
+`?framework=Scikit Learn & Tools` becomes:
 
 ```
 ?framework=Scikit%20Learn%20%26%20Tools
 ```
 
-(`space → %20`, sometimes `+` in a query string; `& → %26`).
+(the space becomes `%20`, or sometimes `+` in a query string, and the `&` becomes
+`%26`).
 
-It's necessary because some characters are **reserved/structural** in a URL. A raw
-space is not a legal URL character, and a raw `&` is the **delimiter between query
-parameters** — so `?framework=Scikit Learn & Tools` would be parsed as a
-`framework=Scikit Learn ` parameter plus a stray ` Tools` parameter, not as a
-single value. Percent-encoding replaces each such byte with `%` followed by its
-hex code, so the server receives the literal intended string and decodes it back
-to `Scikit Learn & Tools` for the `@QueryParam`.
+This is needed because some characters have a special meaning in a URL. A space
+isn't actually a legal URL character at all, and `&` is the separator between query
+parameters. So if the raw string went through unencoded, the server would read it
+as a parameter `framework=Scikit Learn` followed by a separate, meaningless `Tools`
+parameter, instead of as one value. Percent-encoding swaps each of those characters
+for a `%` and its hex code, so the value travels across safely and the server
+decodes it back to the original `Scikit Learn & Tools` when it binds it to my
+`@QueryParam`.
 
 ### Part 4 – Deep Nesting with Sub-Resources
 
@@ -242,21 +259,19 @@ to `Scikit Learn & Tools` for the `@QueryParam`.
 level or the individual method level. What is the benefit of class-level
 placement, and how does method-level overriding work?**
 
-**Class-level placement** declares a default media type for **every** method in the
-resource at once. The benefit is **DRY consistency**: you write it once, every
-handler inherits it, there's no risk of forgetting it on a new method, and the
-intent of the whole resource ("this resource speaks JSON") is stated in one place.
-`EvaluationMetricResource` uses this — both `GET` and `POST` inherit
-`@Produces(APPLICATION_JSON)` from the class.
+Putting `@Produces` on the class sets a default media type for every method in that
+resource in one go. The benefit is that I write it once and every handler inherits
+it, so I can't forget it on a new method, and the whole resource clearly "speaks
+JSON" from a single place. My `EvaluationMetricResource` does exactly this: both the
+`GET` and the `POST` inherit `@Produces(APPLICATION_JSON)` from the class.
 
-**Method-level overriding:** an annotation on a method **takes precedence over the
-class-level one for that method only**. JAX-RS resolves the media type by looking
-at the method first; if it has its own `@Produces`, that wins, otherwise it falls
-back to the class-level value. So you set the common case once on the class and
-override just the exceptional method — e.g. a class defaults to
-`APPLICATION_JSON`, but one endpoint that streams a file overrides with
-`@Produces(MediaType.APPLICATION_OCTET_STREAM)`. The same precedence rule applies
-to `@Consumes`.
+Method-level overriding works because an annotation on a method takes priority over
+the class-level one, but only for that method. JAX-RS looks at the method first: if
+it has its own `@Produces`, that is used; if not, it falls back to the class
+default. So the usual pattern is to set the common case on the class and only
+override the odd method that needs to be different, for example a class that is JSON
+by default but one endpoint that returns a file with
+`@Produces(MediaType.APPLICATION_OCTET_STREAM)`. `@Consumes` follows the same rule.
 
 ### Part 5 – Advanced Error Handling, Exception Mapping & Logging
 
@@ -264,47 +279,53 @@ to `@Consumes`.
 providing a non-existent `workspaceId` must return a 4xx code rather than a 5xx
 code.**
 
-HTTP status classes assign **responsibility for the error**. The **4xx** class
-means *"the client made a mistake"* — the request itself is faulty and the server
-correctly refused it. The **5xx** class means *"the server failed"* — the request
-was reasonable but the server broke while handling it. A non-existent
-`workspaceId` is a defect in the **client's input**: the server worked perfectly,
-detected the bad reference, and rejected it on purpose. So it must be a 4xx (here
-**422 Unprocessable Entity**: the JSON was syntactically valid but semantically
-invalid). Returning 5xx would falsely blame the server, mislead monitoring/alerts,
-and wrongly signal to the client that **retrying the identical request** might
-succeed — whereas a 4xx correctly tells the client to **fix the request** before
-retrying.
+The HTTP status classes are basically about whose fault the error is. A 4xx says
+the client got something wrong and the server correctly refused it, whereas a 5xx
+says the request was fine but the server itself broke while handling it.
+
+A `workspaceId` that doesn't exist is a problem with what the client sent, not a
+server failure. The server did its job, spotted that the reference was invalid and
+rejected it on purpose, so it has to be a 4xx. I return `422 Unprocessable Entity`
+specifically, because the JSON was well-formed but semantically wrong (it points at
+something that isn't there). Returning a 5xx would be misleading on a few levels: it
+would blame the server, it would make monitoring and alerting think the service is
+failing, and it would suggest to the client that the same request might work if it
+just retries, when really the client needs to change the request first.
 
 **Q5.4 — If an operation throws a specific custom exception (e.g.
 `LinkedWorkspaceNotFoundException`) and you also have a global
 `ExceptionMapper<Throwable>`, how does the JAX-RS runtime decide which mapper to
 run?**
 
-JAX-RS picks the **most specific** applicable mapper, by walking up the thrown
-exception's type hierarchy and choosing the mapper whose generic type is the
-**nearest superclass** of the exception. `LinkedWorkspaceNotFoundException` has a
-dedicated `ExceptionMapper<LinkedWorkspaceNotFoundException>`, which is an exact
-(closest) match, so it wins. The `ExceptionMapper<Throwable>` only matches via the
-most distant ancestor (`Throwable`), so it is selected **only when no more
-specific mapper exists** — making it a true fallback safety net. (In this project
-the global mapper additionally re-emits the embedded response of any
-`WebApplicationException`, so deliberate errors like a `NotFoundException`'s 404
-keep their status instead of becoming a 500.)
+JAX-RS chooses the most specific mapper for the exception that was actually thrown.
+It looks at the exception's type and walks up its class hierarchy, then picks the
+`ExceptionMapper` whose type parameter is the closest match.
+`LinkedWorkspaceNotFoundException` has its own
+`ExceptionMapper<LinkedWorkspaceNotFoundException>`, which is an exact match, so
+that one runs. The `ExceptionMapper<Throwable>` only matches through the most
+distant ancestor, `Throwable`, so it is effectively the last resort and only kicks
+in when there is nothing more specific, which is exactly what I want from a global
+catch-all. One extra thing in my version: the global mapper first checks whether the
+exception is a `WebApplicationException` and, if it is, returns the response already
+attached to it. That way a deliberate error such as a `NotFoundException` keeps its
+404 instead of being flattened into a 500.
 
 **Q5.5 — In your filter you interact with `ContainerRequestContext` and
 `ContainerResponseContext`. List two pieces of crucial HTTP metadata you can
 extract from these contexts that are highly valuable for debugging server
 issues.**
 
-1. **The request line — HTTP method + full request URI** (from
-   `ContainerRequestContext.getMethod()` and `getUriInfo().getRequestUri()`):
-   tells you *exactly what was called*, including path and query parameters — the
-   first thing you need to reproduce or locate a problem.
-2. **The response status code** (from `ContainerResponseContext.getStatus()`):
-   tells you the *outcome* of the call (2xx success vs 4xx/5xx failure), so you can
-   immediately spot failing endpoints in the logs.
+Two of the most useful pieces are the HTTP method together with the request URI,
+and the response status code.
 
-Other highly useful items available from these contexts include the **headers**
-(`getHeaders()` — e.g. `Content-Type`, `Authorization`, correlation/trace ids) and
-the **media type**, which help diagnose content-negotiation and auth problems.
+I get the method and URI from the request context (`getMethod()` and
+`getUriInfo().getRequestUri()`). Together these tell me exactly what was called,
+including the path and any query parameters, which is the first thing I need in
+order to reproduce or track down a problem. The response status code comes from the
+response context (`getStatus()`), and that tells me how the call actually ended,
+whether it succeeded or came back as a 4xx or 5xx, so I can quickly pick the failing
+requests out of the log.
+
+Beyond those two, the headers (`getHeaders()`, for example `Content-Type`,
+`Authorization`, or a correlation id) are also valuable, since a lot of bugs come
+down to the wrong content type or a missing or invalid auth header.
