@@ -1,0 +1,10 @@
+target/
+.serverpid
+*.class
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Maven shade plugin byproduct
+dependency-reduced-pom.xml
